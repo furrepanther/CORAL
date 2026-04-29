@@ -85,6 +85,66 @@ class AgentConfig:
     research: bool = True  # enable web search / literature review step in workflow
     stagger_seconds: int = 0  # delay between spawning each agent (rate-limit backpressure)
 
+    # Reliability: crash-burst circuit breaker.
+    # When an agent exits repeatedly in a short window with no clean-exit marker,
+    # the manager pauses it instead of respawning into a tight loop.
+    # 0 in any of the three knobs disables the breaker entirely.
+    restart_burst_threshold: int = 3  # crashes within window before pausing the agent
+    restart_burst_window: int = 30  # seconds; sliding window for crash counting
+    restart_pause_seconds: int = 300  # how long the paused state holds before restart attempts resume
+
+    # Reliability: stall watchdog.
+    # When set (>0), takes precedence over the legacy `timeout` field for output-stall detection.
+    # 0 disables stall detection (matching today's `timeout=0` semantics).
+    stall_timeout: int = 1200
+
+    # Reliability: grader-queue exemption for stall detection.
+    # Skip stall checks for an agent whose latest attempt is pending grading,
+    # but only if the grader heartbeat is fresh and the pending attempt is not stale.
+    grader_heartbeat_max_age: int = 30  # seconds; older heartbeats do not grant exemption
+    grader_pending_max_age: int = 1800  # seconds; older pending attempts no longer exempt
+
+    # Reliability: minimum runtime in seconds before an exit_code==0 is considered "clean"
+    # for runtimes that lack a stable terminal marker (codex/opencode/kiro).
+    min_clean_runtime_seconds: int = 60
+
+    def __post_init__(self) -> None:
+        # Reject negative values for the new reliability knobs;
+        # 0 is treated as "disabled" for the same fields where it makes sense.
+        for field_name in (
+            "restart_burst_threshold",
+            "restart_burst_window",
+            "restart_pause_seconds",
+            "stall_timeout",
+            "grader_heartbeat_max_age",
+            "grader_pending_max_age",
+            "min_clean_runtime_seconds",
+        ):
+            value = getattr(self, field_name)
+            if value < 0:
+                raise ValueError(
+                    f"agents.{field_name} must be >= 0, got {value}"
+                )
+        # If the breaker is enabled at all, the pause must outlast the burst window;
+        # otherwise the breaker can re-arm before the burst counter has cleared.
+        if (
+            self.restart_burst_threshold > 0
+            and self.restart_burst_window > 0
+            and 0 < self.restart_pause_seconds < self.restart_burst_window
+        ):
+            raise ValueError(
+                "agents.restart_pause_seconds must be >= agents.restart_burst_window "
+                f"(got pause={self.restart_pause_seconds}, window={self.restart_burst_window})"
+            )
+
+    def effective_stall_timeout(self) -> int:
+        """Return the stall timeout actually applied by the manager.
+
+        Prefers the newer `stall_timeout` field; falls back to the legacy `timeout`
+        when `stall_timeout` is unset (0). 0 disables stall detection.
+        """
+        return self.stall_timeout if self.stall_timeout > 0 else self.timeout
+
     def heartbeat_interval(self, name: str) -> int:
         """Get the interval for a heartbeat action by name."""
         for action in self.heartbeat:

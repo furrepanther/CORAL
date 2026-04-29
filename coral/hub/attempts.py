@@ -111,6 +111,24 @@ def get_agent_attempts(coral_dir: str | Path, agent_id: str) -> list[Attempt]:
     return [a for a in read_attempts(coral_dir) if a.agent_id == agent_id]
 
 
+def agent_in_grader_queue(
+    coral_dir: str | Path, agent_id: str, attempts: list[Attempt] | None = None
+) -> Attempt | None:
+    """Return the agent's pending attempt if one is in the grader queue, else None.
+
+    A pending attempt is one with `status == "pending"` and `score is None` —
+    matching the daemon's own `_find_pending` filter. Callers (e.g. the manager
+    monitor loop) should pass a pre-fetched `attempts` list once per tick to
+    avoid rescanning the JSON directory for every agent.
+    """
+    if attempts is None:
+        attempts = read_attempts(coral_dir)
+    for a in attempts:
+        if a.agent_id == agent_id and a.status == "pending" and a.score is None:
+            return a
+    return None
+
+
 def get_recent(coral_dir: str | Path, n: int = 10) -> list[Attempt]:
     """Get N most recent attempts (by timestamp)."""
     attempts = read_attempts(coral_dir)
