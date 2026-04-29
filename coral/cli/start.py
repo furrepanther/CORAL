@@ -764,6 +764,14 @@ def cmd_status(args: argparse.Namespace) -> None:
                 agent_logs.setdefault(agent_name, []).append(lf)
 
             class_counts = per_agent_class_counts(coral_dir)
+            stall_state: dict[str, dict[str, int]] = {}
+            stall_file = coral_dir / "public" / "stall_state.json"
+            if stall_file.exists():
+                try:
+                    import json as _json
+                    stall_state = _json.loads(stall_file.read_text())
+                except (OSError, ValueError):
+                    stall_state = {}
 
             print(f"\nAgents: {len(agent_logs)}")
             for agent_name, logs in sorted(agent_logs.items()):
@@ -793,8 +801,16 @@ def cmd_status(args: argparse.Namespace) -> None:
                         rate_str = f"{infra}/{total} ({100 * infra / total:.0f}%)"
                         print(
                             f"    attempts: real={real}  infra={infra}  tune={tune}  "
-                            f"|  stall rate: {rate_str}"
+                            f"|  infra rate: {rate_str}"
                         )
+                stalls_info = stall_state.get(agent_name, {})
+                stalls = stalls_info.get("stalls", 0)
+                warnings = stalls_info.get("stall_warnings", 0)
+                if stalls or warnings:
+                    print(
+                        f"    stalls: {stalls} restarted, "
+                        f"{warnings} warning(s)"
+                    )
 
     direction = read_direction(coral_dir)
     print()

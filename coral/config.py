@@ -73,7 +73,15 @@ class AgentConfig:
     warmstart: WarmStartConfig = field(default_factory=WarmStartConfig)
     runtime_options: dict[str, Any] = field(default_factory=dict)
     max_turns: int = 200
-    timeout: int = 3600
+    # Stall detection (issue #73). `timeout` is the hard threshold where the
+    # manager interrupts and resumes a stalled agent. `stall_warn_after` is a
+    # softer threshold (0 to disable) — at that point we log a warning and
+    # bump per-agent stall_warnings, but do not interrupt. Both are measured
+    # in seconds of log inactivity, and only count against an agent that does
+    # NOT have a pending attempt outstanding (the agent is allowed to be
+    # quiet while waiting on the grader subprocess).
+    timeout: int = 1800
+    stall_warn_after: int = 600
     heartbeat: list[HeartbeatActionConfig] = field(
         default_factory=lambda: [
             HeartbeatActionConfig(name="reflect", every=1),

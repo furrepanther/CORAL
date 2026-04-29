@@ -74,6 +74,14 @@ class AgentManager:
         # timeout/crash) and "tune" (--tune submissions) are recorded for
         # visibility but do not advance the budget counter.
         self._agent_class_counts: dict[str, dict[str, int]] = {}
+        # Per-agent stall observations (issue #73). `stalls` is the count of
+        # confirmed stalls (full-threshold, agent restarted). `stall_warnings`
+        # is the count of softer warnings (warn-threshold, no restart). We
+        # only emit one warning per stall episode so the counter doesn't run
+        # away while the agent is silent.
+        self._agent_stalls: dict[str, int] = {}
+        self._agent_stall_warnings: dict[str, int] = {}
+        self._agent_warned_for_episode: dict[str, bool] = {}
         self._gateway: Any | None = None
         self._gateway_keys: dict[str, str] = {}  # agent_id -> proxy key
         self._grader_proc: multiprocessing.Process | None = None
@@ -615,6 +623,8 @@ class AgentManager:
                 "session_id": handle.session_id,
                 "restarts": self._restart_counts.get(handle.agent_id, 0),
                 "attempts_by_class": class_counts,
+                "stalls": self._agent_stalls.get(handle.agent_id, 0),
+                "stall_warnings": self._agent_stall_warnings.get(handle.agent_id, 0),
             })
         return statuses
 
@@ -653,6 +663,44 @@ class AgentManager:
             if status and status != "pending":
                 scored.add(fname)
         return scored
+
+    def _agent_has_pending_attempt(self, agent_id: str) -> bool:
+        """Return True if the given agent has an attempt currently being graded.
+
+        A pending attempt means `coral eval` has committed and is waiting on
+        the grader daemon. The agent process is legitimately quiet during
+        that window (subprocess-polling sleep loops do not advance the log
+        mtime), so stall detection must skip it — see issue #73.
+        """
+        assert self.paths is not None
+        attempts_dir = self.paths.coral_dir / "public" / "attempts"
+        if not attempts_dir.exists():
+            return False
+        for path in attempts_dir.glob("*.json"):
+            try:
+                data = json.loads(path.read_text())
+            except (json.JSONDecodeError, OSError):
+                continue
+            if data.get("status") == "pending" and data.get("agent_id") == agent_id:
+                return True
+        return False
+
+    @staticmethod
+    def _classify_stall(age: float, warn_after: int, restart_after: int) -> str:
+        """Classify a log-inactivity age into one of {"ok", "warn", "stall"}.
+
+        Pure function so the tier boundaries can be unit-tested without
+        spinning up a manager. Both thresholds in seconds; warn_after=0
+        disables the warning tier, restart_after<=0 disables stall detection
+        entirely. The stall tier wins ties (it's the more severe state).
+        """
+        if restart_after <= 0:
+            return "ok"
+        if age >= restart_after:
+            return "stall"
+        if warn_after > 0 and age >= warn_after:
+            return "warn"
+        return "ok"
 
     def _read_latest_attempt(self, new_files: set[str]) -> dict[str, Any] | None:
         """Read the most recent attempt from a set of new attempt filenames."""
@@ -923,33 +971,76 @@ class AgentManager:
                     self.handles[i] = self._restart_agent(i, prompt=prompt)
                     self._write_agent_pids()
 
-            # Check for stalled agents (alive but no output for > timeout)
-            timeout = self.config.agents.timeout
-            if timeout > 0:
+            # Check for stalled agents (alive but no output for > timeout).
+            # Two-tier (issue #73): a soft warning at `stall_warn_after`
+            # surfaces stalls long before the restart kicks in, so wasted
+            # tokens are visible in `coral status` instead of accumulating
+            # silently for an hour.
+            restart_after = self.config.agents.timeout
+            warn_after = self.config.agents.stall_warn_after
+            if restart_after > 0:
                 for i, handle in enumerate(self.handles):
-                    if handle.alive and self._running:
-                        try:
-                            age = time.time() - handle.log_path.stat().st_mtime
-                        except OSError:
-                            continue
-                        if age > timeout:
+                    if not (handle.alive and self._running):
+                        continue
+                    # Skip agents that are legitimately waiting on the grader.
+                    # Their log won't advance during a long eval, but that's
+                    # not a stall — it's blocked-on-subprocess.
+                    if self._agent_has_pending_attempt(handle.agent_id):
+                        # Reset warning latch so the next genuine stall
+                        # episode after this eval gets one warning.
+                        self._agent_warned_for_episode[handle.agent_id] = False
+                        continue
+                    try:
+                        age = time.time() - handle.log_path.stat().st_mtime
+                    except OSError:
+                        continue
+                    tier = self._classify_stall(age, warn_after, restart_after)
+                    if tier == "warn":
+                        if not self._agent_warned_for_episode.get(handle.agent_id):
+                            self._agent_warned_for_episode[handle.agent_id] = True
+                            self._agent_stall_warnings[handle.agent_id] = (
+                                self._agent_stall_warnings.get(handle.agent_id, 0) + 1
+                            )
                             logger.warning(
-                                f"Agent {handle.agent_id} stalled "
-                                f"({int(age)}s since last output), restarting"
+                                f"Agent {handle.agent_id} possible stall "
+                                f"({int(age)}s since last output, "
+                                f"restart at {restart_after}s)"
                             )
                             if self.verbose:
                                 print(
-                                    f"[coral] {handle.agent_id} stalled "
-                                    f"({int(age)}s with no output), restarting..."
+                                    f"[coral] {handle.agent_id} possibly stalled "
+                                    f"({int(age)}s with no output)..."
                                 )
-                            self.handles[i] = self._interrupt_and_resume(
-                                i,
-                                "You were automatically restarted because you "
-                                "produced no output for an extended period. "
-                                "Continue working on the task.",
-                                prompt_source="timeout",
+                            self._write_stall_state()
+                    elif tier == "stall":
+                        self._agent_stalls[handle.agent_id] = (
+                            self._agent_stalls.get(handle.agent_id, 0) + 1
+                        )
+                        # Reset the warning latch — next quiet stretch is a
+                        # fresh episode and deserves its own warning.
+                        self._agent_warned_for_episode[handle.agent_id] = False
+                        logger.warning(
+                            f"Agent {handle.agent_id} stalled "
+                            f"({int(age)}s since last output), restarting"
+                        )
+                        if self.verbose:
+                            print(
+                                f"[coral] {handle.agent_id} stalled "
+                                f"({int(age)}s with no output), restarting..."
                             )
-                            self._write_agent_pids()
+                        self.handles[i] = self._interrupt_and_resume(
+                            i,
+                            "You were automatically restarted because you "
+                            "produced no output for an extended period. "
+                            "Continue working on the task.",
+                            prompt_source="timeout",
+                        )
+                        self._write_agent_pids()
+                        self._write_stall_state()
+                    else:
+                        # tier == "ok": clear any latched warning state once
+                        # the agent is producing output again.
+                        self._agent_warned_for_episode[handle.agent_id] = False
 
             # Interruptible sleep
             if self._stop_event.wait(timeout=check_interval):
@@ -1023,6 +1114,29 @@ class AgentManager:
             # Also write JSON mapping for the web UI to check process liveness
             pid_map_file = self.paths.coral_dir / "public" / "agent_pids.json"
             pid_map_file.write_text(json.dumps(pid_map))
+
+    def _write_stall_state(self) -> None:
+        """Persist per-agent stall counts so `coral status` can read them.
+
+        The CLI runs out-of-process and only sees disk; this is the cheapest
+        IPC. Written on every stall warning / restart, plus periodically
+        from the monitor loop so a long-running agent's "0 stalls" state
+        actually shows up.
+        """
+        if not self.paths:
+            return
+        state = {
+            agent_id: {
+                "stalls": self._agent_stalls.get(agent_id, 0),
+                "stall_warnings": self._agent_stall_warnings.get(agent_id, 0),
+            }
+            for agent_id in {h.agent_id for h in self.handles}
+        }
+        stall_file = self.paths.coral_dir / "public" / "stall_state.json"
+        try:
+            stall_file.write_text(json.dumps(state))
+        except OSError as e:
+            logger.warning(f"Failed to write stall state: {e}")
 
     def _atexit_cleanup(self) -> None:
         """Safety net: kill any surviving agent processes on interpreter exit."""
