@@ -59,6 +59,11 @@ class KiroRuntime:
         prompt_source: str | None = None,
         task_name: str | None = None,
         task_description: str | None = None,
+        # Kiro does not currently route through the LiteLLM gateway, but
+        # accept these kwargs so the manager can call all four runtimes
+        # through a single signature without runtime-specific dispatch.
+        gateway_url: str | None = None,
+        gateway_api_key: str | None = None,
     ) -> AgentHandle:
         agent_id_file = worktree_path / ".coral_agent_id"
         agent_id = agent_id_file.read_text().strip() if agent_id_file.exists() else "unknown"

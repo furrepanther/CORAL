@@ -38,16 +38,17 @@ class ClaudeCodeRuntime:
     ) -> str:
         """Classify a Claude Code subprocess exit.
 
-        Looks for a `"type":"result"` line in the agent's stream-json log; that
-        is Claude Code's stable terminal marker (emitted on normal session end,
-        including `max_turns` reached). Falls back to a "session_error" tag
-        when the log indicates a missing session, then to the uptime heuristic
-        for ambiguous exits.
+        Claude Code emits a `"type":"result"` line on normal session end
+        (including `max_turns` reached). That marker is the only reliable
+        signal of a healthy completion — uptime alone is not sufficient,
+        because a long-running session can still die unexpectedly mid-turn.
+
+        Returns:
+            "clean" only when exit_code == 0 AND the result marker is present.
+            "session_error" when the log shows a missing-session error.
+            "no_result" otherwise (the burst counter consumes this).
         """
-        from coral.agent.exit_classifier import (
-            classify_by_uptime,
-            claude_code_has_result,
-        )
+        from coral.agent.exit_classifier import claude_code_has_result
 
         # Avoid circular import: _log_has_session_error lives in manager.py.
         from coral.agent.manager import _log_has_session_error
@@ -56,7 +57,7 @@ class ClaudeCodeRuntime:
             return "clean"
         if _log_has_session_error(log_path):
             return "session_error"
-        return classify_by_uptime(exit_code, uptime_seconds, min_clean_runtime_seconds)
+        return "no_result"
 
     def start(
         self,

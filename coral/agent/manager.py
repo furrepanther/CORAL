@@ -83,11 +83,15 @@ class AgentManager:
         # is the wall-clock deadline at which a paused agent is allowed to
         # restart again. `_pause_count` and `_last_fault_at` are persisted
         # metadata on `agent_state.json` for `coral status`.
+        # `_pending_restart_after_pause` tracks agents whose pause just
+        # expired so the dead-agent branch restarts them once without
+        # re-classifying the original exit (which would double-count it).
         self._started_at: dict[str, float] = {}
         self._crash_history: dict[str, deque[RestartEvent]] = {}
         self._paused_until: dict[str, float] = {}
         self._pause_count: dict[str, int] = {}
         self._last_fault_at: dict[str, str] = {}
+        self._pending_restart_after_pause: set[str] = set()
         self._gateway: Any | None = None
         self._gateway_keys: dict[str, str] = {}  # agent_id -> proxy key
         self._grader_proc: multiprocessing.Process | None = None
@@ -758,14 +762,19 @@ class AgentManager:
     def _is_paused(self, agent_id: str) -> bool:
         """Return True if the agent is currently in PAUSED state.
 
-        A pause is lifted automatically when its deadline passes; the next
-        observed exit will resume normal restart behavior.
+        On expiry the deadline is cleared, the crash window is reset (so a
+        single fresh exit cannot retrigger the breaker), and the agent is
+        marked for an unconditional one-shot restart on the next dead-agent
+        observation. This avoids re-classifying the same dead handle and
+        double-counting the exit that originally triggered the pause.
         """
         until = self._paused_until.get(agent_id)
         if until is None:
             return False
         if time.time() >= until:
             self._paused_until.pop(agent_id, None)
+            self._crash_history.pop(agent_id, None)
+            self._pending_restart_after_pause.add(agent_id)
             self._persist_agent_state()
             logger.info(f"Agent {agent_id} pause expired; eligible for restart")
             return False
@@ -799,7 +808,14 @@ class AgentManager:
         log_path: Path,
         classification: str,
     ) -> None:
-        """Append a non-clean exit event and prune entries outside the window."""
+        """Append a non-clean exit event and prune entries outside the window.
+
+        When the breaker is disabled (any knob == 0) we do not even allocate
+        history: the breaker cannot fire, so accumulating events would just
+        leak memory across an overnight run.
+        """
+        if not self._breaker_enabled():
+            return
         history = self._crash_history.setdefault(agent_id, deque(maxlen=64))
         history.append(
             RestartEvent(
@@ -809,21 +825,32 @@ class AgentManager:
                 classification=classification,
             )
         )
-        window = self.config.agents.restart_burst_window
-        if window > 0:
-            cutoff = time.time() - window
-            while history and history[0].timestamp < cutoff:
-                history.popleft()
+        cutoff = time.time() - self.config.agents.restart_burst_window
+        while history and history[0].timestamp < cutoff:
+            history.popleft()
+
+    def _breaker_enabled(self) -> bool:
+        """Return True iff all three breaker knobs are positive (>0).
+
+        Setting any of `restart_burst_threshold`, `restart_burst_window`, or
+        `restart_pause_seconds` to 0 disables the breaker entirely, matching
+        the `agents.timeout=0`-disables-the-stall-watchdog convention.
+        """
+        cfg = self.config.agents
+        return (
+            cfg.restart_burst_threshold > 0
+            and cfg.restart_burst_window > 0
+            and cfg.restart_pause_seconds > 0
+        )
 
     def _should_pause_for_burst(self, agent_id: str) -> bool:
         """Return True iff the recent crash count meets the configured threshold."""
-        threshold = self.config.agents.restart_burst_threshold
-        if threshold <= 0:
-            return False  # 0 disables the breaker entirely
+        if not self._breaker_enabled():
+            return False
         history = self._crash_history.get(agent_id)
         if not history:
             return False
-        return len(history) >= threshold
+        return len(history) >= self.config.agents.restart_burst_threshold
 
     def _enter_paused(self, agent_id: str, log_path: Path) -> None:
         """Transition the agent into PAUSED, dump fault evidence, persist state."""
@@ -891,6 +918,32 @@ class AgentManager:
         except OSError as e:
             logger.error(f"Failed to write fault dump for {agent_id}: {e}")
             return None
+
+    def _grader_heartbeat_age(self) -> float | None:
+        """Return age in seconds of the grader daemon heartbeat, or None.
+
+        The daemon writes `<coral_dir>/public/grader_daemon_heartbeat` on
+        startup and on each idle tick. A missing or unreadable file means we
+        cannot certify grader liveness and must fall back to non-exempt
+        stall checks.
+        """
+        if self.paths is None:
+            return None
+        hb_path = self.paths.coral_dir / "public" / "grader_daemon_heartbeat"
+        try:
+            return time.time() - hb_path.stat().st_mtime
+        except OSError:
+            return None
+
+    def _attempt_age_seconds(self, timestamp_iso: str) -> float | None:
+        """Return age in seconds of an attempt's ISO timestamp, or None on parse failure."""
+        try:
+            ts = datetime.fromisoformat(timestamp_iso.replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            return None
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=UTC)
+        return (datetime.now(UTC) - ts).total_seconds()
 
     def _persist_agent_state(self) -> None:
         """Persist current paused/active state to public/agent_state.json."""
@@ -1088,6 +1141,28 @@ class AgentManager:
                     if self._is_paused(agent_id):
                         continue
 
+                    # Just-expired pause: restart without re-classifying. The
+                    # exit that triggered the pause was already counted; the
+                    # crash window was cleared on expiry, so a single fresh
+                    # exit on the new process cannot retrigger the breaker.
+                    if agent_id in self._pending_restart_after_pause:
+                        self._pending_restart_after_pause.discard(agent_id)
+                        count = self._restart_counts.get(agent_id, 0) + 1
+                        eval_count = self._get_eval_count()
+                        latest = self._read_latest_attempt(current_attempts, agent_id=agent_id)
+                        prompt = self._build_score_prompt(latest, eval_count) if latest else None
+                        logger.warning(
+                            f"Agent {agent_id} restarting after pause cooldown "
+                            f"(restart #{count})"
+                        )
+                        if self.verbose:
+                            print(f"[coral] {agent_id} resuming after pause cooldown")
+                        self.handles[i] = self._restart_agent(
+                            i, prompt=prompt, prompt_source="post-pause"
+                        )
+                        self._write_agent_pids()
+                        continue
+
                     exit_code = handle.process.returncode if handle.process else None
                     log_path = handle.log_path
 
@@ -1125,33 +1200,74 @@ class AgentManager:
                     self.handles[i] = self._restart_agent(i, prompt=prompt)
                     self._write_agent_pids()
 
-            # Check for stalled agents (alive but no output for > timeout)
-            timeout = self.config.agents.timeout
-            if timeout > 0:
+            # Check for stalled agents (alive but no output for > timeout).
+            # `effective_stall_timeout` honors the new `stall_timeout` field
+            # when set and falls back to the legacy `timeout` for backward
+            # compatibility; either being 0 disables the watchdog entirely.
+            stall_threshold = self.config.agents.effective_stall_timeout()
+            if stall_threshold > 0:
+                # Cache pending attempts and the grader heartbeat once per tick
+                # so per-agent exemption checks do not rescan the attempts dir
+                # or stat the heartbeat file repeatedly.
+                from coral.hub.attempts import agent_in_grader_queue, read_attempts
+                attempts_cache = read_attempts(self.paths.coral_dir)
+                grader_heartbeat_age = self._grader_heartbeat_age()
+                grader_fresh = (
+                    grader_heartbeat_age is not None
+                    and grader_heartbeat_age <= self.config.agents.grader_heartbeat_max_age
+                )
+
                 for i, handle in enumerate(self.handles):
                     if handle.alive and self._running:
                         try:
                             age = time.time() - handle.log_path.stat().st_mtime
                         except OSError:
                             continue
-                        if age > timeout:
-                            logger.warning(
-                                f"Agent {handle.agent_id} stalled "
-                                f"({int(age)}s since last output), restarting"
+                        if age <= stall_threshold:
+                            continue
+
+                        # Grader-queue exemption: an agent that just submitted
+                        # an attempt is silent because the grader is working,
+                        # not because it deadlocked. Skip the stall check
+                        # only when the grader heartbeat is fresh and the
+                        # pending attempt has not aged past the cap.
+                        if grader_fresh:
+                            pending = agent_in_grader_queue(
+                                self.paths.coral_dir, handle.agent_id, attempts_cache
                             )
-                            if self.verbose:
-                                print(
-                                    f"[coral] {handle.agent_id} stalled "
-                                    f"({int(age)}s with no output), restarting..."
-                                )
-                            self.handles[i] = self._interrupt_and_resume(
-                                i,
-                                "You were automatically restarted because you "
-                                "produced no output for an extended period. "
-                                "Continue working on the task.",
-                                prompt_source="timeout",
+                            if pending is not None:
+                                pending_age = self._attempt_age_seconds(pending.timestamp)
+                                if (
+                                    pending_age is not None
+                                    and pending_age <= self.config.agents.grader_pending_max_age
+                                ):
+                                    logger.info(
+                                        f"Agent {handle.agent_id} silent for "
+                                        f"{int(age)}s but pending attempt "
+                                        f"{pending.commit_hash[:12]} is in grader queue "
+                                        f"({int(pending_age)}s old, heartbeat "
+                                        f"{int(grader_heartbeat_age)}s ago); "
+                                        f"stall check exempt"
+                                    )
+                                    continue
+
+                        logger.warning(
+                            f"Agent {handle.agent_id} stalled "
+                            f"({int(age)}s since last output), restarting"
+                        )
+                        if self.verbose:
+                            print(
+                                f"[coral] {handle.agent_id} stalled "
+                                f"({int(age)}s with no output), restarting..."
                             )
-                            self._write_agent_pids()
+                        self.handles[i] = self._interrupt_and_resume(
+                            i,
+                            "You were automatically restarted because you "
+                            "produced no output for an extended period. "
+                            "Continue working on the task.",
+                            prompt_source="timeout",
+                        )
+                        self._write_agent_pids()
 
             # Interruptible sleep
             if self._stop_event.wait(timeout=check_interval):
