@@ -9,10 +9,9 @@ def test_generate_coral_md_has_required_sections():
         task=TaskConfig(
             name="Kernel Optimization",
             description="Optimize the kernel for speed.",
-            files=["kernel_builder.py"],
             tips="Profile first!",
         ),
-        grader=GraderConfig(type="kernel_builder"),
+        grader=GraderConfig(direction="minimize"),
         agents=AgentConfig(count=2),
     )
 
@@ -21,7 +20,6 @@ def test_generate_coral_md_has_required_sections():
     # Task info
     assert "Kernel Optimization" in md
     assert "Optimize the kernel for speed" in md
-    assert "kernel_builder.py" in md
 
     # Tips
     assert "Profile first!" in md
@@ -30,8 +28,8 @@ def test_generate_coral_md_has_required_sections():
     assert "agent-1" in md
     assert "creator: agent-1" in md
 
-    # Score direction (kernel_builder specific)
-    assert "lower cycle count is better" in md
+    # Score direction comes from grader.direction now (no type-based table)
+    assert "lower is better" in md
 
     # Core structure
     assert "Orientation" in md
@@ -59,7 +57,7 @@ def test_generate_coral_md_has_required_sections():
 def test_generate_coral_md_without_optional_sections():
     config = CoralConfig(
         task=TaskConfig(name="Simple Task", description="Do the thing."),
-        grader=GraderConfig(type="function"),
+        grader=GraderConfig(),
     )
 
     md = generate_coral_md(config, "agent-5")
@@ -78,10 +76,9 @@ def test_generate_coral_md_single_agent():
         task=TaskConfig(
             name="Solo Task",
             description="Optimize alone.",
-            files=["target.py"],
             tips="Be thorough.",
         ),
-        grader=GraderConfig(type="function"),
+        grader=GraderConfig(),
         agents=AgentConfig(count=1),
     )
 
@@ -90,7 +87,6 @@ def test_generate_coral_md_single_agent():
     # Core content present
     assert "Solo Task" in md
     assert "Optimize alone." in md
-    assert "target.py" in md
     assert "Be thorough." in md
     assert "agent-1" in md
     assert "fully autonomous" in md
@@ -108,17 +104,15 @@ def test_generate_coral_md_single_agent():
     assert "Record Knowledge" in md
 
 
-def test_generate_coral_md_score_directions():
-    for grader_type, expected_fragment in [
-        ("kernel_builder", "lower cycle count"),
-        ("swebench", "pass rate"),
-        ("terminalbench", "pass rate"),
-        ("function", "higher is better"),
-        ("unknown_type", "higher is better"),
+def test_generate_coral_md_score_direction_from_config():
+    """Score direction now comes solely from grader.direction (no type table)."""
+    for direction, expected in [
+        ("maximize", "higher is better"),
+        ("minimize", "lower is better"),
     ]:
         config = CoralConfig(
             task=TaskConfig(name="t", description="d"),
-            grader=GraderConfig(type=grader_type),
+            grader=GraderConfig(direction=direction),
         )
         md = generate_coral_md(config, "agent-1")
-        assert expected_fragment in md, f"Missing '{expected_fragment}' for grader type '{grader_type}'"
+        assert expected in md, f"Missing '{expected}' for direction '{direction}'"

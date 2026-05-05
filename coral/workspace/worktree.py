@@ -145,9 +145,14 @@ def setup_shared_state(worktree_path: Path, coral_dir: Path, shared_dir_name: st
     shared_items = [
         "notes",
         "skills",
+        "agents",
         "attempts",
         "logs",
         "heartbeat",
+        # Per-attempt eval artifacts (subprocess logs, terminal recordings,
+        # verifier output, etc.) that the grader writes via TaskGrader.eval_logs_dir.
+        # Lives outside the grader checkout so it survives daemon cleanup.
+        "eval_logs",
     ]
     for item in shared_items:
         src = coral_public / item
@@ -160,11 +165,20 @@ def setup_shared_state(worktree_path: Path, coral_dir: Path, shared_dir_name: st
                 dst.symlink_to(src.resolve())
 
 
-def setup_claude_settings(worktree_path: Path, coral_dir: Path, *, research: bool = True) -> None:
-    """Write Claude Code settings.json with permissions.
+def setup_claude_settings(
+    worktree_path: Path,
+    coral_dir: Path,
+    *,
+    research: bool = True,
+    gateway_url: str | None = None,
+    gateway_api_key: str | None = None,
+) -> None:
+    """Write Claude Code settings.json with permissions and gateway env.
 
     Grants the agent all tool permissions via allow rules (replacing
-    --dangerously-skip-permissions).
+    --dangerously-skip-permissions).  When a gateway is configured, sets
+    ANTHROPIC_BASE_URL and ANTHROPIC_API_KEY in the settings ``env`` so
+    they override the user's global ``~/.claude/settings.json``.
     """
     claude_dir = worktree_path / ".claude"
     claude_dir.mkdir(exist_ok=True)
@@ -198,23 +212,50 @@ def setup_claude_settings(worktree_path: Path, coral_dir: Path, *, research: boo
     if not research:
         deny_rules.extend(["WebSearch", "WebFetch"])
 
-    settings: dict = {
-        "permissions": {
-            "allow": allow_rules,
-            "deny": deny_rules,
-        },
+    permissions: dict = {
+        "defaultMode": "auto",
+        "allow": allow_rules,
+        "deny": deny_rules,
     }
 
-    settings_path = claude_dir / "settings.json"
+    settings: dict = {
+        "permissions": permissions,
+    }
+
+    # Route agent traffic through gateway by overriding env in settings.
+    # Claude Code reads env vars from settings, not the OS environment,
+    # so process-level env vars have no effect.
+    if gateway_url or gateway_api_key:
+        env: dict[str, str] = {}
+        if gateway_url:
+            env["ANTHROPIC_BASE_URL"] = gateway_url
+        if gateway_api_key:
+            env["ANTHROPIC_API_KEY"] = gateway_api_key
+        # Clear custom headers so the agent doesn't send them to the
+        # local gateway — LiteLLM handles upstream headers via its own
+        # config.  Without this, headers from the user's global settings
+        env["ANTHROPIC_CUSTOM_HEADERS"] = ""
+        settings["env"] = env
+
+    settings_path = claude_dir / "settings.local.json"
     # Always overwrite — each agent needs its own copy
     settings_path.write_text(json.dumps(settings, indent=2) + "\n")
 
 
-def setup_opencode_settings(worktree_path: Path, coral_dir: Path, *, research: bool = True) -> None:
+def setup_opencode_settings(
+    worktree_path: Path,
+    coral_dir: Path,
+    *,
+    research: bool = True,
+    gateway_url: str | None = None,
+    gateway_api_key: str | None = None,
+) -> None:
     """Write OpenCode opencode.json with scoped permissions.
 
     Allows access to the agent's worktree and shared public state,
     but denies access to .coral/private/ (grader data, answer keys).
+    When a gateway is configured, patches the provider's baseURL so
+    agent traffic routes through the LiteLLM proxy.
     """
     opencode_dir = worktree_path / ".opencode"
     opencode_dir.mkdir(exist_ok=True)
@@ -225,6 +266,7 @@ def setup_opencode_settings(worktree_path: Path, coral_dir: Path, *, research: b
     settings: dict = {
         "$schema": "https://opencode.ai/config.json",
         "permission": {
+            "*": "allow",
             "external_directory": {
                 public_pattern: "allow",
             },
@@ -247,8 +289,76 @@ def setup_opencode_settings(worktree_path: Path, coral_dir: Path, *, research: b
         },
     }
 
+    if gateway_url:
+        provider_options: dict[str, str] = {"baseURL": gateway_url}
+        if gateway_api_key:
+            provider_options["apiKey"] = gateway_api_key
+        settings["provider"] = {
+            "openai": {
+                "npm": "@ai-sdk/openai",
+                "name": "openai",
+                "options": provider_options,
+                "models": {
+                    "gpt-5.4": {
+                        "name": "gpt-5.4"
+                    },
+                    "claude-opus-4-6": {
+                        "name": "claude-opus-4-6"
+                    }
+                }
+            },
+        }
+
     settings_path = opencode_dir / "opencode.json"
     settings_path.write_text(json.dumps(settings, indent=2) + "\n")
+
+
+def setup_codex_settings(
+    worktree_path: Path,
+    coral_dir: Path,
+    *,
+    research: bool = True,
+    gateway_url: str | None = None,
+    gateway_api_key: str | None = None,
+) -> None:
+    """Write Codex CLI config.toml with sandbox, approval, and web search settings.
+
+    Sets the agent to full-auto mode (no approval prompts, workspace-write
+    sandbox) and toggles web_search based on the *research* flag.  When a
+    gateway is configured, sets ``base_url`` so the agent routes
+    traffic through the LiteLLM proxy.
+    """
+    codex_dir = worktree_path / ".codex"
+    codex_dir.mkdir(exist_ok=True)
+
+    web_search = "live" if research else "disabled"
+
+    lines = [
+        'model = "gpt-5.4"',
+        'approval_policy = "never"',
+        'sandbox_mode = "danger-full-access"',
+        'personality = "pragmatic"',
+    ]
+
+    if gateway_url:
+        lines += [
+            'model_provider = "litellm"\n',
+            '[model_providers.litellm]',
+            'name = "LiteLLM Proxy"',
+            f'base_url = "{gateway_url}/v1"',
+            'wire_api = "responses"',
+            'env_key = "OPENAI_API_KEY"',
+        ]
+
+    lines += [
+        '\n[tools]',
+        f'web_search = "{web_search}"',
+    ]
+
+    config_toml = "\n".join(lines) + "\n"
+
+    settings_path = codex_dir / "config.toml"
+    settings_path.write_text(config_toml)
 
 
 def setup_worktree_env(worktree_path: Path, setup_commands: list[str]) -> None:
@@ -262,6 +372,12 @@ def setup_worktree_env(worktree_path: Path, setup_commands: list[str]) -> None:
 
     Each worktree gets its own isolated ``.venv`` via UV_PROJECT_ENVIRONMENT
     to prevent concurrent agents from corrupting a shared venv.
+
+    Idempotent: if the worktree's ``.venv`` is already populated (the python
+    binary exists), skip both the setup commands and the coral reinstall.
+    Deps don't change mid-run, so re-running ``uv sync`` on every
+    interrupt-and-resume cycle is wasted work. To force a re-sync, delete the
+    ``.venv`` directory before resuming.
     """
     if not setup_commands:
         return
@@ -269,6 +385,14 @@ def setup_worktree_env(worktree_path: Path, setup_commands: list[str]) -> None:
     # Force uv to create/use a venv inside this worktree, even if
     # pyproject.toml is resolved from a parent directory.
     worktree_venv = worktree_path / ".venv"
+    venv_python = worktree_venv / "bin" / "python"
+    if venv_python.exists():
+        logger.debug(
+            f"Worktree venv already populated at {worktree_venv}, "
+            f"skipping setup commands"
+        )
+        return
+
     env_override = {"UV_PROJECT_ENVIRONMENT": str(worktree_venv)}
     run_setup_commands(setup_commands, worktree_path, extra_env=env_override)
 

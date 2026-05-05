@@ -10,14 +10,19 @@ from coral.config import (
     GraderConfig,
     RunConfig,
     TaskConfig,
+    WarmStartConfig,
     WorkspaceConfig,
 )
 
 
 def test_config_roundtrip():
     config = CoralConfig(
-        task=TaskConfig(name="test", description="A test", files=["main.py"], tips="Be fast"),
-        grader=GraderConfig(type="function", module="my_module", args={"k": 1}),
+        task=TaskConfig(name="test", description="A test", tips="Be fast"),
+        grader=GraderConfig(
+            entrypoint="my_pkg.grader:Grader",
+            setup=["uv pip install -e ./my_pkg"],
+            args={"k": 1},
+        ),
         agents=AgentConfig(count=2, model="opus"),
     )
 
@@ -26,8 +31,9 @@ def test_config_roundtrip():
         restored = CoralConfig.from_yaml(f.name)
 
     assert restored.task.name == "test"
-    assert restored.task.files == ["main.py"]
-    assert restored.grader.type == "function"
+    assert restored.grader.entrypoint == "my_pkg.grader:Grader"
+    assert restored.grader.setup == ["uv pip install -e ./my_pkg"]
+    assert restored.grader.args == {"k": 1}
     assert restored.agents.count == 2
     assert restored.agents.model == "opus"
 
@@ -35,12 +41,32 @@ def test_config_roundtrip():
 def test_config_from_dict():
     data = {
         "task": {"name": "t", "description": "d"},
-        "grader": {"type": "kernel_builder"},
+        "grader": {"entrypoint": "kernel_builder.grader:Grader"},
     }
     config = CoralConfig.from_dict(data)
     assert config.task.name == "t"
-    assert config.grader.type == "kernel_builder"
+    assert config.grader.entrypoint == "kernel_builder.grader:Grader"
     assert config.agents.count == 1  # default
+
+
+def test_legacy_grader_type_rejected():
+    """Removed grader.type field raises a ValueError with migration guidance."""
+    data = {
+        "task": {"name": "t", "description": "d"},
+        "grader": {"type": "function"},
+    }
+    with pytest.raises(ValueError, match="grader.type"):
+        CoralConfig.from_dict(data)
+
+
+def test_legacy_grader_module_rejected():
+    """Removed grader.module field raises a ValueError with migration guidance."""
+    data = {
+        "task": {"name": "t", "description": "d"},
+        "grader": {"module": "my.module"},
+    }
+    with pytest.raises(ValueError, match="grader.module"):
+        CoralConfig.from_dict(data)
 
 
 def test_agent_runtime_options_roundtrip():
@@ -171,15 +197,15 @@ def test_run_config_defaults():
     )
     assert config.run.verbose is False
     assert config.run.ui is False
-    assert config.run.tmux is True
+    assert config.run.session == "tmux"
 
 
 def test_run_config_dotlist_override():
     config = CoralConfig(
         task=TaskConfig(name="t", description="d"),
     )
-    merged = CoralConfig.merge_dotlist(config, ["run.tmux=false", "run.verbose=true"])
-    assert merged.run.tmux is False
+    merged = CoralConfig.merge_dotlist(config, ["run.session=local", "run.verbose=true"])
+    assert merged.run.session == "local"
     assert merged.run.verbose is True
     assert merged.run.ui is False
 
@@ -187,7 +213,7 @@ def test_run_config_dotlist_override():
 def test_run_config_roundtrip():
     config = CoralConfig(
         task=TaskConfig(name="t", description="d"),
-        run=RunConfig(verbose=True, ui=True, tmux=False),
+        run=RunConfig(verbose=True, ui=True, session="docker"),
     )
 
     with tempfile.NamedTemporaryFile(suffix=".yaml", mode="w", delete=False) as f:
@@ -196,7 +222,7 @@ def test_run_config_roundtrip():
 
     assert restored.run.verbose is True
     assert restored.run.ui is True
-    assert restored.run.tmux is False
+    assert restored.run.session == "docker"
 
 
 def test_to_dict_excludes_task_dir():
@@ -206,3 +232,52 @@ def test_to_dict_excludes_task_dir():
     config.task_dir = "/some/path"
     d = config.to_dict()
     assert "task_dir" not in d
+
+
+# --- Warm-start config tests ---
+
+
+def test_warmstart_config_defaults():
+    data = {
+        "task": {"name": "t", "description": "d"},
+    }
+    config = CoralConfig.from_dict(data)
+    assert config.agents.warmstart.enabled is False
+
+
+def test_warmstart_config_from_yaml():
+    data = {
+        "task": {"name": "t", "description": "d"},
+        "agents": {
+            "warmstart": {
+                "enabled": True,
+            },
+        },
+    }
+    config = CoralConfig.from_dict(data)
+    assert config.agents.warmstart.enabled is True
+
+
+def test_warmstart_config_roundtrip():
+    config = CoralConfig(
+        task=TaskConfig(name="t", description="d"),
+        agents=AgentConfig(
+            warmstart=WarmStartConfig(enabled=True),
+        ),
+    )
+
+    with tempfile.NamedTemporaryFile(suffix=".yaml", mode="w", delete=False) as f:
+        config.to_yaml(f.name)
+        restored = CoralConfig.from_yaml(f.name)
+
+    assert restored.agents.warmstart.enabled is True
+
+
+def test_warmstart_dotlist_override():
+    config = CoralConfig(
+        task=TaskConfig(name="t", description="d"),
+    )
+    merged = CoralConfig.merge_dotlist(config, [
+        "agents.warmstart.enabled=true",
+    ])
+    assert merged.agents.warmstart.enabled is True

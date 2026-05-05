@@ -25,8 +25,6 @@ task:
     Evaluated across 5 network configs (intra-AWS, intra-Azure, intra-GCP,
     inter-cloud AGZ, inter-cloud GAZ2).
 
-  files:
-    - "initial_program.py"
 
 grader:
   timeout: 600
@@ -47,4 +45,4 @@ workspace:
 run:
   verbose: false
   ui: false
-  tmux: true
+  session: tmux

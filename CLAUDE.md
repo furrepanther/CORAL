@@ -35,6 +35,8 @@ Key concepts:
 ```
 coral start --config task.yaml
   → Creates .coral/ shared state directory
+  → If grader.entrypoint set: creates .coral/private/grader_venv/
+    and runs grader.setup commands inside it
   → Creates per-agent git worktrees
   → Generates CORAL.md in each worktree
   → Spawns Claude Code agents
@@ -44,6 +46,8 @@ Each agent:
   → Makes changes, commits
   → Agent runs `coral eval -m "description"`
   → Eval writes attempt JSON to .coral/attempts/
+  → Daemon spawns a worker subprocess in the grader venv,
+    feeds JSON over stdin, gets ScoreBundle back via stdout
   → Agent sees score, decides next move
   → Shares notes in .coral/notes/
   → Packages tools as skills in .coral/skills/
@@ -71,7 +75,7 @@ coral start -c task.yaml                          # Launch agents
 coral start -c task.yaml agents.count=4           # Override config via dotlist
 coral start -c task.yaml run.verbose=true         # Verbose output
 coral start -c task.yaml run.ui=true              # Also launch web dashboard
-coral start -c task.yaml run.tmux=false           # No tmux session
+coral start -c task.yaml run.session=local           # No tmux session
 coral resume                                      # Resume a previous run
 coral resume agents.model=opus                    # Resume with model override
 coral resume -i "Try greedy approaches"           # Resume with additional instruction
@@ -110,13 +114,13 @@ uv run ruff format .
 
 2. **BaseGrader** with helpers: `_make_score()`, `_make_bundle()`, `grade_sync()`
 
-3. **FunctionGrader** wraps any `(codebase_path, tasks) -> Score|float|bool` callable
+3. **FunctionGrader** wraps any `(codebase_path, tasks) -> Score|float|bool` callable. Note: legacy `grader.type: function` config has been removed; if you need this, ship a thin `TaskGrader` subclass via `grader.entrypoint` instead.
 
 4. **Attempt** dataclass: commit_hash, agent_id, title, score, status, feedback
 
 5. **Hub modules**: attempts (JSON CRUD + search), notes (Markdown + YAML frontmatter), skills (directories with SKILL.md)
 
-6. **Config**: YAML-based `CoralConfig` with task, grader, agents, sharing, workspace, run sections
+6. **Config**: YAML-based `CoralConfig` with task, grader, agents, sharing, workspace, run sections. `grader.entrypoint = "module.path:ClassName"` is the primary way to wire a grader; `grader.setup` is a shell-command list run once in `.coral/private/grader_venv/` to install the grader package. The legacy `eval/grader.py` auto-discovery still works but emits `DeprecationWarning`.
 
 ## Key Files
 
@@ -128,8 +132,10 @@ uv run ruff format .
 | `coral/grader/protocol.py` | GraderInterface protocol |
 | `coral/grader/base.py` | BaseGrader base class |
 | `coral/grader/task_grader.py` | TaskGrader base class for task-specific graders |
-| `coral/grader/loader.py` | Grader discovery and loading |
-| `coral/grader/builtin/function_grader.py` | Wrap functions as graders |
+| `coral/grader/loader.py` | Resolve grader from `grader.entrypoint` (subprocess) or legacy `eval/grader.py` |
+| `coral/grader/subprocess_grader.py` | Worker-subprocess grader runtime (used by entrypoint path) |
+| `coral/grader/builtin/function_grader.py` | Wrap functions as graders (no longer wired via task.yaml) |
+| `coral/workspace/grader_env.py` | `setup_grader_env()` — `uv venv .coral/private/grader_venv/` + run grader.setup |
 | `coral/hub/attempts.py` | Attempt CRUD + leaderboard |
 | `coral/hub/notes.py` | Note listing/reading |
 | `coral/hub/skills.py` | Skill listing/reading |

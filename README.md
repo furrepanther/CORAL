@@ -3,22 +3,14 @@
 
 <img src="assets/logo.png" alt="Coral" width="360">
 
-### **Spawn Agents. Share Knowledge. Optimize Forever.**
 
-<p>
-  <img src="assets/mit_logo.png" alt="MIT" height="50">
-  &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
-  <img src="assets/nus.png" alt="NUS" height="50">
-  &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
-  <img src="assets/stanford.png" alt="Stanford" height="50">
-</p>
+#### Robust, lightweight infrastructure for multi-agent self-evolution, built for autoresearch.
 
-**Ao Qu\*, Yihao Yan\*, Han Zheng\*, Zijian Zhou\*, Shao Yong Ong, Fenglu Hong, Jiacheng Zhu**
+## 🚀 Supercharge Your AutoResearch
 
-**Bryan Kian Hsiang Low‡, Jinhua Zhao‡, Paul Pu Liang‡**
 
-<sub>\* Equal Contribution &nbsp;&nbsp; ‡ Equal Advising</sub>
 
+[![Paper](https://img.shields.io/badge/Paper-arXiv%3A2604.01658-B31B1B.svg?logo=arxiv&logoColor=white)](https://arxiv.org/abs/2604.01658v1)
 [![Blog](https://img.shields.io/badge/Blog-CORAL-FF6B6B.svg?logo=hashnode&logoColor=white)](https://human-agent-society.github.io/CORAL/)
 [![MIT License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-3776AB.svg?logo=python&logoColor=white)](https://python.org)
@@ -29,7 +21,7 @@
 </div>
 
 <p align="center">
-<a href="#installation">Installation</a> · <a href="#supported-agents">Supported Agents</a> · <a href="#usage">Usage</a> · <a href="#how-it-works">How It Works</a> · <a href="#quick-start">Quick Start</a> · <a href="#cli-reference">CLI Reference</a> · <a href="#examples">Examples</a> · <a href="#license">License</a>
+<a href="#installation">Installation</a> · <a href="#supported-agents">Supported Agents</a> · <a href="#usage">Usage</a> · <a href="#how-it-works">How It Works</a> · <a href="#quick-start">Quick Start</a> · <a href="#cli-reference">CLI Reference</a> · <a href="#using-opencode">OpenCode</a> · <a href="#using-the-gateway-for-custom-models">Gateway</a> · <a href="#examples">Examples</a> · <a href="#license">License</a>
 </p>
 
 
@@ -41,6 +33,8 @@ Want self-improving AI without the configuration overhead? Try Coral.
 
 ### 🔥 News!
 
+- **[2026-04-24]** **Rubric judges** — two reusable LLM-judge grader packages for open-ended tasks (reports, memos, legal analysis). Static rubrics (`race_japan_grader`) and auto-evolving dynamic rubrics (`apex_judge`), both spawning Claude Code as the judge. See the [Rubric Judges guide](docs/content/docs/guides/rubric-judge.mdx) and the new `examples/race-japan-elderly/`, `examples/apex-eggshell-skull/`, `examples/apex-frontier-bu/` tasks.
+- **[2026-04-03]** Our paper, “CORAL: Towards Autonomous Multi-Agent Evolution for Open-Ended Discovery,” is now out! Check it out on [Arxiv](https://arxiv.org/pdf/2604.01658).
 - **[2026-03-18]** CORAL is released! Check out our [blog post](https://human-agent-society.github.io/CORAL/).
 
 ![Demo](assets/demo.gif)
@@ -92,7 +86,11 @@ uv run coral start -c examples/kernel_builder/task.yaml
 uv run coral start -c task.yaml agents.count=4 agents.model=opus
 uv run coral start -c task.yaml run.verbose=true        # stream agent output
 uv run coral start -c task.yaml run.ui=true              # also launch web dashboard
-uv run coral start -c task.yaml run.tmux=false           # skip tmux, run inline
+uv run coral start -c task.yaml run.session=local         # skip tmux, run inline
+uv run coral start -c task.yaml run.session=docker        # run inside Docker container
+
+# warm-start: research phase before coding (agents do literature review first)
+uv run coral start -c task.yaml agents.warmstart.enabled=true agents.research=true
 
 # stop and resume
 uv run coral stop                                        # stop anytime
@@ -118,6 +116,8 @@ Each agent runs in its own git worktree branch. Shared state (attempts, notes, s
 | **Eval loop** | Agents call `uv run coral eval -m "..."` to stage, commit, and grade in one shot |
 | **CLI orchestration** | 17+ commands: `start`, `stop`, `status`, `eval`, `log`, `ui`, and more |
 | **Web dashboard** | `uv run coral ui` — real-time leaderboard, attempt diffs, agent monitoring |
+
+**Deep research:** Agents come with a bundled `deep-research` skill that guides structured literature review — web search, saving raw sources, writing research notes, and building an index. It runs automatically during warm-start (`agents.warmstart.enabled=true`), and agents can also invoke it mid-run when pivoting to a new approach. Requires `agents.research=true` for web search.
 
 ### Quick Start
 
@@ -196,8 +196,12 @@ task:
     and returns -distance as the score (shorter = higher).
 
 grader:
-  type: function
-  module: eval.grader
+  # Quick-start uses auto-discovered eval/grader.py (emits DeprecationWarning).
+  # For production tasks, package the grader and switch to:
+  #   entrypoint: "tsp_grader.grader:Grader"
+  #   setup: ["uv pip install -e ./grader"]
+  # See docs/guides/custom-grader for the migration walkthrough.
+  timeout: 300
 
 agents:
   count: 1
@@ -286,6 +290,105 @@ coral/
 
 </details>
 
+### Using OpenCode
+
+To use [OpenCode](https://github.com/opencode-ai/opencode) as your agent runtime, you need to provide an `opencode.json` configuration file in your seed directory. This file configures OpenCode's permissions and provider settings.
+
+Here is an example from `examples/circle_packing/seed/opencode.json`:
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "permission": {
+    "external_directory": "allow",
+    "question": "deny",
+    "doom_loop": "allow",
+    "bash": "allow",
+    "edit": "allow",
+    "read": "allow",
+    "write": "allow",
+    "webfetch": "deny",
+    "websearch": "deny",
+    "codesearch": "allow",
+    "lsp": "allow",
+    "skill": "allow"
+  },
+  "provider": {
+    "claude": {
+      "npm": "@ai-sdk/anthropic",
+      "name": "claude",
+      "options": {
+        "baseURL": "http://localhost:4000/v1",
+        "apiKey": "xxx"
+      },
+      "models": {
+        "claude-opus-4-6": {
+          "name": "claude-opus-4-6"
+        }
+      }
+    }
+  }
+}
+```
+
+Key points:
+- Set all permissions to `"allow"` (except `question`, `webfetch`, `websearch` which should be `"deny"`) so the agent can run autonomously without interactive prompts.
+- The `provider` section configures which model to use. When using the gateway (see below), point `baseURL` at `http://localhost:<gateway_port>/v1` and set `apiKey` to any placeholder value — the gateway handles authentication.
+- Place `opencode.json` in your seed directory so it gets copied into each agent's worktree.
+
+Then set your task config to use OpenCode:
+
+```yaml
+agents:
+  runtime: opencode
+  model: claude/claude-opus-4-6  # must match a model defined in opencode.json
+```
+
+### Using the Gateway for Custom Models
+
+CORAL includes a built-in **LiteLLM gateway** that acts as a proxy between agents and model providers. This is useful when you want to:
+
+- Route agent requests through a single proxy with unified API key management
+- Use custom or self-hosted models
+- Add request logging and per-agent tracking
+- Use providers that require non-standard authentication
+
+#### Setting up the gateway
+
+**1. Create a LiteLLM config file** (e.g. `litellm_config.yaml`) alongside your `task.yaml`:
+
+```yaml
+# examples/circle_packing/litellm_config.yaml
+model_list:
+  - model_name: "claude-opus-4-6"
+    litellm_params:
+      model: "anthropic/claude-opus-4-6"
+      api_key: "YOUR_ANTHROPIC_API_KEY"
+
+litellm_settings:
+  drop_params: true
+```
+
+Each entry in `model_list` defines a model the gateway will serve. The `model_name` is what agents request; `litellm_params.model` is the upstream provider model. See the [LiteLLM docs](https://docs.litellm.ai/docs/proxy/configs) for full configuration options (multiple providers, load balancing, fallbacks, etc.).
+
+**2. Enable the gateway in your task config:**
+
+```yaml
+agents:
+  runtime: opencode           # or claude_code, codex
+  model: claude/claude-opus-4-6
+  gateway:
+    enabled: true
+    port: 4000                # port the gateway listens on
+    config: "./litellm_config.yaml"  # path relative to task.yaml
+```
+
+**3. Point your agent at the gateway.** For OpenCode, set `baseURL` in `opencode.json` to `http://localhost:<port>/v1`. For Claude Code, the gateway URL is automatically injected.
+
+When you run `coral start`, the gateway starts before agents are spawned, and all agent API requests are routed through it. The gateway automatically assigns each agent a unique proxy key for per-agent request tracking.
+
+See `examples/circle_packing/` for a complete working example using OpenCode with the gateway.
+
 ### Examples
 
 Ready-to-run task configurations in `examples/`:
@@ -316,6 +419,9 @@ uv run ruff check .
 uv run ruff format .
 ```
 
+> [!IMPORTANT]
+> **Docker requirement:** Some built-in graders (e.g. SWE-bench, terminal-bench) use [Harbor](https://github.com/corca-ai/harbor) to run evaluations inside Docker containers. CORAL itself must **not** run inside Docker in this case, as Docker-in-Docker (DinD) is not supported. Run CORAL directly on the host machine.
+
 This project is released under MIT [LICENSE](LICENSE).
 
 ### Citation
@@ -323,16 +429,15 @@ This project is released under MIT [LICENSE](LICENSE).
 ⭐ If you find CORAL useful, please consider giving us a Star and/or citing it in your work:
 
 ```bibtex
-@misc{coral2026,
-  title  = {Evolve Like Coral: Towards Autonomous Multi-Agent Evolution},
-  author = {Qu, Ao and Yan, Yihao and Zheng, Han and Zhou, Zijian and
-            Ong, Shao Yong and Hong, Fenglu and Zhu, Jiacheng and
-            Low, Bryan Kian Hsiang and Zhao, Jinhua and Liang, Paul Pu},
+@article{coral2026,
+  title  = {CORAL: Towards Autonomous Multi-Agent Evolution for Open-Ended Discovery},
+  author = {Qu, Ao and Zheng, Han and Zhou, Zijian and Yan, Yihao and Tang, Yihong and Ong, Shao Yong and Hong, Fenglu and Zhou, Kaichen and Jiang, Chonghe and Kong, Minwei and Zhu, Jiacheng and Jiang, Xuan and Li, Sirui and Wu, Cathy and Low, Bryan Kian Hsiang and Zhao, Jinhua and Liang, Paul Pu},
+  journal = {arXiv preprint arXiv:2604.01658},
   year   = {2026},
-  url    = {https://human-agent-society.github.io/CORAL/}
+  url    = {https://arxiv.org/pdf/2604.01658}
 }
 ```
 
 ### Acknowledgement
 
-We thank the [TNT Accelerator](https://www.tnt.so/) for their generous support of various API credits that have helped during the development of Coral. We would also like to thank many of the inspiring prior works such as [OpenEvolve](https://github.com/algorithmicsuperintelligence/openevolve), [autoresearch](https://github.com/karpathy/autoresearch), [TTT Discover](https://arxiv.org/abs/2503.08951),  etc., that have led to the ideation of Coral.
+We thank the [TNT Accelerator](https://www.tnt.so/) for their generous support of various API credits that have helped during the development of Coral. We would also like to thank many of the inspiring prior works such as [OpenEvolve](https://github.com/algorithmicsuperintelligence/openevolve), [autoresearch](https://github.com/karpathy/autoresearch), [TTT Discover](https://arxiv.org/abs/2601.16175),  etc., that have led to the ideation of Coral.

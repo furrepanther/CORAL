@@ -60,8 +60,6 @@ task:
 
     Simply return the optimized Evolved class, do not provide explanations.
 
-  files:
-    - "initial_program.py"
 
 grader:
   timeout: 360
@@ -82,4 +80,4 @@ workspace:
 run:
   verbose: false
   ui: false
-  tmux: true
+  session: tmux

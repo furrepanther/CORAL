@@ -17,7 +17,6 @@ from coral.workspace.repo import (
     copy_eval_to_private,
     copy_private_data,
     copy_seed_directory,
-    copy_seed_files,
 )
 
 logger = logging.getLogger(__name__)
@@ -44,6 +43,7 @@ def slugify(name: str) -> str:
 
 
 _SEED_SKILLS_DIR = Path(__file__).parent.parent / "template" / "skills"
+_SEED_AGENTS_DIR = Path(__file__).parent.parent / "template" / "agents"
 
 
 def create_project(config: CoralConfig, config_dir: Path | None = None) -> ProjectPaths:
@@ -62,9 +62,10 @@ def create_project(config: CoralConfig, config_dir: Path | None = None) -> Proje
                 │   │   ├── notes/
                 │   │   ├── change_summary.md
                 │   │   ├── skills/
+                │   │   ├── agents/
                 │   │   ├── attempts/
                 │   │   ├── logs/
-                │   │   └── settings.json
+                │   │   └── settings.local.json
                 │   ├── private/
                 │   └── config.yaml
                 ├── repo/                # cloned from source
@@ -76,9 +77,13 @@ def create_project(config: CoralConfig, config_dir: Path | None = None) -> Proje
     task_slug = slugify(config.task.name)
     task_dir = results_dir / task_slug
 
-    # Create timestamped run directory
-    timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
-    run_dir = task_dir / timestamp
+    # Use explicit run_dir if provided, otherwise generate timestamped one
+    if config.workspace.run_dir:
+        run_dir = Path(config.workspace.run_dir).resolve()
+        task_dir = run_dir.parent
+    else:
+        timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+        run_dir = task_dir / timestamp
     coral_dir = run_dir / ".coral"
     agents_dir = run_dir / "agents"
     run_repo = run_dir / "repo"
@@ -90,8 +95,10 @@ def create_project(config: CoralConfig, config_dir: Path | None = None) -> Proje
     (coral_dir / "public" / "attempts").mkdir(parents=True, exist_ok=True)
     (coral_dir / "public" / "logs").mkdir(parents=True, exist_ok=True)
     (coral_dir / "public" / "skills").mkdir(parents=True, exist_ok=True)
+    (coral_dir / "public" / "agents").mkdir(parents=True, exist_ok=True)
     (coral_dir / "public" / "notes").mkdir(parents=True, exist_ok=True)
     (coral_dir / "public" / "heartbeat").mkdir(parents=True, exist_ok=True)
+    (coral_dir / "public" / "eval_logs").mkdir(parents=True, exist_ok=True)
     (coral_dir / "private").mkdir(parents=True, exist_ok=True)
     agents_dir.mkdir(parents=True, exist_ok=True)
 
@@ -108,8 +115,22 @@ def create_project(config: CoralConfig, config_dir: Path | None = None) -> Proje
                     shutil.copytree(skill_dir, dst)
                     logger.info(f"Seeded skill: {skill_dir.name}")
 
+    # Seed bundled agent templates from coral/template/agents/
+    seed_agents_dir = _SEED_AGENTS_DIR
+    if seed_agents_dir.is_dir():
+        for agent_file in seed_agents_dir.iterdir():
+            if agent_file.is_file():
+                dst = coral_dir / "public" / "agents" / agent_file.name
+                if not dst.exists():
+                    shutil.copy2(agent_file, dst)
+                    logger.info(f"Seeded agent template: {agent_file.name}")
+
     # Save config
     config.to_yaml(coral_dir / "config.yaml")
+
+    # Save config_dir so resume can restore task_dir for relative path resolution
+    effective_config_dir = config.task_dir or config_dir or Path.cwd()
+    (coral_dir / "config_dir").write_text(str(effective_config_dir))
 
     # Create/update "latest" symlink at task_dir/latest -> this run directory
     latest_link = task_dir / "latest"
@@ -129,19 +150,22 @@ def create_project(config: CoralConfig, config_dir: Path | None = None) -> Proje
     # Auto-copy eval/ to .coral/private/eval/ (if present in task directory)
     copy_eval_to_private(task_source_dir, coral_dir)
 
-    # Auto-detect and copy seed/ (if present in task directory and no explicit seed paths)
-    if not config.task.seed:
-        seed_dir = task_source_dir / "seed"
-        if seed_dir.is_dir():
-            copy_seed_directory(seed_dir, repo_dir)
-
-    # Copy explicit seed files into the repo
-    if config.task.seed:
-        copy_seed_files(config.task.seed, repo_dir, config_dir or Path.cwd())
+    # Auto-copy seed/ into repo (if present in task directory)
+    seed_dir = task_source_dir / "seed"
+    if seed_dir.is_dir():
+        copy_seed_directory(seed_dir, repo_dir)
 
     # Copy private grader data into .coral/ (hidden from agents)
     if config.grader.private:
         copy_private_data(config.grader.private, coral_dir, config_dir or Path.cwd())
+
+    # Bootstrap the grader's isolated venv at .coral/private/grader_venv/ and
+    # run any user-supplied install steps. Skipped when the task is still on the
+    # legacy eval/grader.py (in-process) path.
+    if config.grader.entrypoint:
+        from coral.workspace.grader_env import setup_grader_env
+
+        setup_grader_env(coral_dir, config.grader, config_dir or Path.cwd())
 
     return ProjectPaths(
         results_dir=results_dir,

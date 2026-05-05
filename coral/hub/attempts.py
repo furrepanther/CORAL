@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import os
+import tempfile
 from datetime import datetime
 from pathlib import Path
 
@@ -16,10 +18,70 @@ def _attempts_dir(coral_dir: str | Path) -> Path:
 
 
 def write_attempt(coral_dir: str | Path, attempt: Attempt) -> Path:
-    """Write an attempt record to JSON."""
+    """Write an attempt record to JSON atomically (tmp + rename).
+
+    Readers (monitor loop, grader daemon, `coral wait`) may poll these files
+    concurrently with writes. Using tmp + rename guarantees readers see either
+    the old complete file or the new complete file, never a partial write.
+    """
     path = _attempts_dir(coral_dir) / f"{attempt.commit_hash}.json"
-    path.write_text(json.dumps(attempt.to_dict(), indent=2))
+    payload = json.dumps(attempt.to_dict(), indent=2)
+    # Write to a temp file in the same directory (same filesystem -> atomic rename).
+    fd, tmp_path = tempfile.mkstemp(
+        prefix=f".{attempt.commit_hash}.",
+        suffix=".json.tmp",
+        dir=path.parent,
+    )
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(payload)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, path)
+    except Exception:
+        # Clean up temp file on any failure so we don't leak .tmp files.
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
     return path
+
+
+def read_attempt(coral_dir: str | Path, commit_hash: str) -> Attempt | None:
+    """Read a single attempt by commit hash. Returns None if missing or malformed."""
+    path = _attempts_dir(coral_dir) / f"{commit_hash}.json"
+    if not path.exists():
+        return None
+    try:
+        return Attempt.from_dict(json.loads(path.read_text()))
+    except (json.JSONDecodeError, KeyError, OSError):
+        return None
+
+
+def increment_eval_count(coral_dir: str | Path) -> int:
+    """Increment the global eval counter at .coral/public/eval_count and return the new value."""
+    counter_file = Path(coral_dir) / "public" / "eval_count"
+    count = 0
+    if counter_file.exists():
+        try:
+            count = int(counter_file.read_text().strip())
+        except ValueError:
+            pass
+    count += 1
+    counter_file.write_text(str(count))
+    return count
+
+
+def read_eval_count(coral_dir: str | Path) -> int:
+    """Read the global eval counter (0 if missing)."""
+    counter_file = Path(coral_dir) / "public" / "eval_count"
+    if not counter_file.exists():
+        return 0
+    try:
+        return int(counter_file.read_text().strip())
+    except ValueError:
+        return 0
 
 
 def read_attempts(coral_dir: str | Path) -> list[Attempt]:
@@ -47,6 +109,33 @@ def get_leaderboard(coral_dir: str | Path, top_n: int = 20, direction: str = "ma
 def get_agent_attempts(coral_dir: str | Path, agent_id: str) -> list[Attempt]:
     """Get all attempts from a specific agent."""
     return [a for a in read_attempts(coral_dir) if a.agent_id == agent_id]
+
+
+def agent_in_grader_queue(
+    coral_dir: str | Path, agent_id: str, attempts: list[Attempt] | None = None
+) -> Attempt | None:
+    """Return the agent's newest pending attempt if any is in the grader queue.
+
+    A pending attempt is one with `status == "pending"` and `score is None` —
+    matching the daemon's own `_find_pending` filter. When multiple pending
+    attempts exist for the same agent (e.g. the agent crashed and resubmitted
+    while a prior attempt was still queued), the newest by ISO timestamp is
+    returned so the stall-watchdog exemption uses the most relevant evidence.
+    Callers (e.g. the manager monitor loop) should pass a pre-fetched
+    `attempts` list once per tick to avoid rescanning the JSON directory for
+    every agent.
+    """
+    if attempts is None:
+        attempts = read_attempts(coral_dir)
+    candidates = [
+        a
+        for a in attempts
+        if a.agent_id == agent_id and a.status == "pending" and a.score is None
+    ]
+    if not candidates:
+        return None
+    candidates.sort(key=lambda a: a.timestamp, reverse=True)
+    return candidates[0]
 
 
 def get_recent(coral_dir: str | Path, n: int = 10) -> list[Attempt]:

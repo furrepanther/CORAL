@@ -11,6 +11,8 @@ import yaml
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
+from coral.cli._helpers import is_docker_run_alive
+
 
 def _coral_dir(request: Request) -> Path:
     return request.app.state.coral_dir
@@ -235,8 +237,10 @@ def _enumerate_runs(results_dir: Path, current_coral_dir: Path) -> dict:
                     pid = int(pid_file.read_text().strip())
                     os.kill(pid, 0)
                     status = "running"
-                except (ProcessLookupError, ValueError):
+                except (ProcessLookupError, PermissionError, ValueError):
                     pass
+            if status == "stopped" and is_docker_run_alive(coral_dir):
+                status = "running"
 
             # Count attempts
             attempts_dir = coral_dir / "public" / "attempts"
@@ -331,8 +335,11 @@ async def get_status(request: Request) -> JSONResponse:
             manager_pid = int(pid_file.read_text().strip())
             os.kill(manager_pid, 0)
             manager_alive = True
-        except (ProcessLookupError, ValueError):
+        except (ProcessLookupError, PermissionError, ValueError):
             pass
+    is_docker = not manager_alive and is_docker_run_alive(coral_dir)
+    if is_docker:
+        manager_alive = True
 
     # Eval count
     eval_count_file = coral_dir / "public" / "eval_count"
@@ -354,10 +361,11 @@ async def get_status(request: Request) -> JSONResponse:
     agent_logs = list_log_files(coral_dir)
     agents_status: list[dict[str, Any]] = []
 
-    # Read per-agent PID map for process liveness checks
+    # Read per-agent PID map for process liveness checks.
+    # Skip for Docker runs — container-internal PIDs aren't valid on the host.
     agent_pid_map: dict[str, int] = {}
     pid_map_file = coral_dir / "public" / "agent_pids.json"
-    if pid_map_file.exists():
+    if not is_docker and pid_map_file.exists():
         try:
             agent_pid_map = json.loads(pid_map_file.read_text())
         except (json.JSONDecodeError, OSError):
@@ -375,7 +383,7 @@ async def get_status(request: Request) -> JSONResponse:
                         os.kill(pid, 0)
                         any_agent_alive = True
                         break
-                    except ProcessLookupError:
+                    except (ProcessLookupError, PermissionError):
                         pass
             except (ValueError, OSError):
                 pass
@@ -396,10 +404,10 @@ async def get_status(request: Request) -> JSONResponse:
             try:
                 os.kill(agent_pid, 0)
                 status = "active"
-            except ProcessLookupError:
+            except (ProcessLookupError, PermissionError):
                 status = "stopped"
-        elif any_agent_alive:
-            # agent.pids says something is running but no per-agent mapping
+        elif any_agent_alive or is_docker:
+            # Container or agent.pids says something is running but no per-agent mapping
             status = "active" if age < 300 else "idle"
         else:
             # No PID info — log recency as last resort

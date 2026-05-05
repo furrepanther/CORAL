@@ -10,6 +10,8 @@ import threading
 from pathlib import Path
 from typing import Any
 
+from coral.agent.exit_classifier import classify_by_uptime
+from coral.agent.process import open_agent_stderr_for_log_dir
 from coral.agent.runtime import AgentHandle, write_coral_log_entry
 from coral.workspace.repo import _clean_env
 
@@ -61,6 +63,21 @@ class CodexRuntime:
     def extract_session_id(self, log_path: Path) -> str | None:
         return _extract_codex_session_id(log_path)
 
+    def classify_exit(
+        self,
+        log_path: Path,
+        exit_code: int | None,
+        uptime_seconds: float | None,
+        min_clean_runtime_seconds: int = 60,
+    ) -> str:
+        """Classify a Codex CLI subprocess exit using the uptime fallback.
+
+        Codex does not emit a stable terminal marker we can rely on, so an
+        `exit_code==0` only counts as clean when the agent ran for at least
+        `min_clean_runtime_seconds`.
+        """
+        return classify_by_uptime(exit_code, uptime_seconds, min_clean_runtime_seconds)
+
     def start(
         self,
         worktree_path: Path,
@@ -75,6 +92,8 @@ class CodexRuntime:
         prompt_source: str | None = None,
         task_name: str | None = None,
         task_description: str | None = None,
+        gateway_url: str | None = None,
+        gateway_api_key: str | None = None,
     ) -> AgentHandle:
         """Start a Codex agent in the given worktree.
 
@@ -126,9 +145,32 @@ class CodexRuntime:
         logger.info(f"Command: {' '.join(cmd)}")
 
         agent_env = _clean_env()
-        agent_env["UV_PROJECT_ENVIRONMENT"] = str(worktree_path / ".venv")
+        worktree_venv = str(worktree_path / ".venv")
+        agent_env["UV_PROJECT_ENVIRONMENT"] = worktree_venv
+        # Set VIRTUAL_ENV so login shells (which reset PATH) can restore it
+        # via /etc/profile.d/coral-venv.sh in Docker containers.
+        agent_env["VIRTUAL_ENV"] = worktree_venv
+        # Prepend .venv/bin to PATH for non-login shells
+        venv_bin = str(worktree_path / ".venv" / "bin")
+        agent_env["PATH"] = venv_bin + ":" + agent_env.get("PATH", "")
+
+        # Route through gateway if configured
+        if gateway_url:
+            agent_env["OPENAI_BASE_URL"] = gateway_url
+            logger.info(f"Codex agent {agent_id}: routing via gateway at {gateway_url}")
+        if gateway_api_key:
+            agent_env["OPENAI_API_KEY"] = gateway_api_key
 
         log_file = open(log_path, "w", buffering=1)
+
+        # Per-agent stderr capture under public/diagnostics/<agent_id>/agent.err.
+        err_path: Path | None = None
+        err_file: Any = None
+        stderr_target: Any = subprocess.STDOUT
+        opened = open_agent_stderr_for_log_dir(log_dir, agent_id)
+        if opened is not None:
+            err_path, err_file = opened
+            stderr_target = err_file
 
         write_coral_log_entry(
             log_file,
@@ -145,7 +187,7 @@ class CodexRuntime:
                 cmd,
                 cwd=str(worktree_path),
                 stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
+                stderr=stderr_target,
                 start_new_session=True,
                 env=agent_env,
             )
@@ -181,7 +223,7 @@ class CodexRuntime:
                 cmd,
                 cwd=str(worktree_path),
                 stdout=log_file,
-                stderr=subprocess.STDOUT,
+                stderr=stderr_target,
                 start_new_session=True,
                 env=agent_env,
             )
@@ -195,6 +237,8 @@ class CodexRuntime:
             worktree_path=worktree_path,
             log_path=log_path,
             session_id=resume_session_id,
+            err_file=err_file,
+            err_path=err_path,
             _log_file=log_file_ref,
         )
 

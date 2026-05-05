@@ -1,17 +1,20 @@
 """Integration tests for the full CORAL flow."""
 
-import json
 import subprocess
 import tempfile
 from pathlib import Path
 
-import yaml
-
 from coral.config import AgentConfig, CoralConfig, GraderConfig, TaskConfig, WorkspaceConfig
-from coral.hub.attempts import format_leaderboard, get_leaderboard, read_attempts, search_attempts, write_attempt
+from coral.hub.attempts import (
+    format_leaderboard,
+    get_leaderboard,
+    read_attempts,
+    search_attempts,
+    write_attempt,
+)
 from coral.template.coral_md import generate_coral_md
 from coral.types import Attempt
-from coral.workspace import create_project, setup_gitignore, write_agent_id
+from coral.workspace import create_project
 
 
 def test_full_workspace_creation():
@@ -31,8 +34,8 @@ def test_full_workspace_creation():
 
         # Create project
         config = CoralConfig(
-            task=TaskConfig(name="optimize", description="Make it fast", files=["main.py"], tips="Profile first"),
-            grader=GraderConfig(type="function"),
+            task=TaskConfig(name="optimize", description="Make it fast", tips="Profile first"),
+            grader=GraderConfig(),
             agents=AgentConfig(count=2),
             workspace=WorkspaceConfig(results_dir=str(base / "results"), repo_path=str(repo)),
         )
@@ -109,10 +112,9 @@ def test_coral_md_generation():
         task=TaskConfig(
             name="Kernel Optimization",
             description="Optimize the VLIW kernel for minimum cycle count.",
-            files=["kernel_builder.py", "helpers.py"],
             tips="- Use SIMD vectorization\n- Minimize memory stalls",
         ),
-        grader=GraderConfig(type="kernel_builder"),
+        grader=GraderConfig(direction="minimize"),
         agents=AgentConfig(count=3),
     )
 
@@ -121,10 +123,6 @@ def test_coral_md_generation():
     # Must contain task info
     assert "Kernel Optimization" in md
     assert "VLIW kernel" in md
-
-    # Must list key files
-    assert "kernel_builder.py" in md
-    assert "helpers.py" in md
 
     # Must include tips
     assert "SIMD vectorization" in md

@@ -19,7 +19,7 @@ from coral.workspace import (
 def _make_config(repo_path: str, results_dir: str | None = None) -> CoralConfig:
     return CoralConfig(
         task=TaskConfig(name="Test Task", description="Test task"),
-        grader=GraderConfig(type="function"),
+        grader=GraderConfig(),
         agents=AgentConfig(count=2),
         workspace=WorkspaceConfig(
             results_dir=results_dir or os.path.join(repo_path, "results"),
@@ -166,5 +166,39 @@ def test_create_project_setup_runs_sequentially():
         result_file = worktree / "mydir" / "result.txt"
         assert result_file.exists()
         assert result_file.read_text().strip() == "done"
+
+
+def test_setup_worktree_env_skips_when_venv_exists():
+    """Idempotent: if .venv/bin/python already exists, setup is skipped.
+
+    Avoids re-running uv sync on every interrupt-and-resume cycle, which
+    can otherwise dominate restart latency.
+    """
+    with tempfile.TemporaryDirectory() as d:
+        worktree = Path(d) / "worktree"
+        worktree.mkdir()
+        # Pre-create a fake populated venv
+        venv_bin = worktree / ".venv" / "bin"
+        venv_bin.mkdir(parents=True)
+        (venv_bin / "python").write_text("#!/bin/sh\nexit 0\n")
+        (venv_bin / "python").chmod(0o755)
+
+        # If setup ran, this would create the marker file
+        marker = worktree / "setup_ran.marker"
+        setup_worktree_env(worktree, [f"touch {marker}"])
+
+        assert not marker.exists(), "Setup should have been skipped"
+
+
+def test_setup_worktree_env_runs_when_venv_missing():
+    """When .venv doesn't exist yet, setup runs as normal (first launch path)."""
+    with tempfile.TemporaryDirectory() as d:
+        worktree = Path(d) / "worktree"
+        worktree.mkdir()
+
+        marker = worktree / "setup_ran.marker"
+        setup_worktree_env(worktree, [f"touch {marker}"])
+
+        assert marker.exists(), "Setup should have run on first launch"
 
 

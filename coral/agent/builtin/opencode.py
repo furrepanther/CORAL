@@ -10,6 +10,8 @@ import threading
 from pathlib import Path
 from typing import Any
 
+from coral.agent.exit_classifier import classify_by_uptime
+from coral.agent.process import open_agent_stderr_for_log_dir
 from coral.agent.runtime import AgentHandle, write_coral_log_entry
 from coral.workspace.repo import _clean_env
 
@@ -58,6 +60,21 @@ class OpenCodeRuntime:
     def extract_session_id(self, log_path: Path) -> str | None:
         return _extract_opencode_session_id(log_path)
 
+    def classify_exit(
+        self,
+        log_path: Path,
+        exit_code: int | None,
+        uptime_seconds: float | None,
+        min_clean_runtime_seconds: int = 60,
+    ) -> str:
+        """Classify an OpenCode subprocess exit using the uptime fallback.
+
+        OpenCode's log format does not yet include a stable terminal marker,
+        so we use the conservative uptime heuristic: `exit_code==0` is clean
+        only when the agent ran for at least `min_clean_runtime_seconds`.
+        """
+        return classify_by_uptime(exit_code, uptime_seconds, min_clean_runtime_seconds)
+
     def start(
         self,
         worktree_path: Path,
@@ -72,6 +89,8 @@ class OpenCodeRuntime:
         prompt_source: str | None = None,
         task_name: str | None = None,
         task_description: str | None = None,
+        gateway_url: str | None = None,
+        gateway_api_key: str | None = None,
     ) -> AgentHandle:
         """Start an OpenCode agent in the given worktree."""
         agent_id_file = worktree_path / ".coral_agent_id"
@@ -92,6 +111,10 @@ class OpenCodeRuntime:
                 prompt = "Begin."
 
         # Build command: opencode run [flags] <prompt>
+        # Keep the full provider/model format (e.g. "minimax/MiniMax-M2.5")
+        # so OpenCode knows which provider to use. When the gateway is active,
+        # the provider's baseURL is patched in opencode.json to route through
+        # the LiteLLM proxy.
         cmd = [
             "opencode", "run",
             "--model", model,
@@ -108,9 +131,32 @@ class OpenCodeRuntime:
         logger.info(f"Command: {' '.join(cmd)}")
 
         agent_env = _clean_env()
-        agent_env["UV_PROJECT_ENVIRONMENT"] = str(worktree_path / ".venv")
+        worktree_venv = str(worktree_path / ".venv")
+        agent_env["UV_PROJECT_ENVIRONMENT"] = worktree_venv
+        # Set VIRTUAL_ENV so login shells (which reset PATH) can restore it
+        # via /etc/profile.d/coral-venv.sh in Docker containers.
+        agent_env["VIRTUAL_ENV"] = worktree_venv
+        # Prepend .venv/bin to PATH for non-login shells
+        venv_bin = str(worktree_path / ".venv" / "bin")
+        agent_env["PATH"] = venv_bin + ":" + agent_env.get("PATH", "")
+
+        # Route through gateway if configured
+        if gateway_url:
+            agent_env["OPENAI_BASE_URL"] = gateway_url
+            logger.info(f"OpenCode agent {agent_id}: routing via gateway at {gateway_url}")
+        if gateway_api_key:
+            agent_env["OPENAI_API_KEY"] = gateway_api_key
 
         log_file = open(log_path, "w", buffering=1)
+
+        # Per-agent stderr capture under public/diagnostics/<agent_id>/agent.err.
+        err_path: Path | None = None
+        err_file: Any = None
+        stderr_target: Any = subprocess.STDOUT
+        opened = open_agent_stderr_for_log_dir(log_dir, agent_id)
+        if opened is not None:
+            err_path, err_file = opened
+            stderr_target = err_file
 
         write_coral_log_entry(
             log_file,
@@ -127,7 +173,7 @@ class OpenCodeRuntime:
                 cmd,
                 cwd=str(worktree_path),
                 stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
+                stderr=stderr_target,
                 start_new_session=True,
                 env=agent_env,
             )
@@ -163,7 +209,7 @@ class OpenCodeRuntime:
                 cmd,
                 cwd=str(worktree_path),
                 stdout=log_file,
-                stderr=subprocess.STDOUT,
+                stderr=stderr_target,
                 start_new_session=True,
                 env=agent_env,
             )
@@ -178,4 +224,6 @@ class OpenCodeRuntime:
             log_path=log_path,
             session_id=resume_session_id,
             _log_file=log_file_ref,
+            err_file=err_file,
+            err_path=err_path,
         )

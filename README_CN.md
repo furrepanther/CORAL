@@ -35,6 +35,7 @@
 
 ### 🔥 News!
 
+- **[2026-04-24]** 新增 **Rubric 评审 (Rubric Judges)** —— 两个开箱即用的 LLM 评审 grader 包，专为开放式任务（报告、备忘、法律分析等）设计：静态评审准则 (`race_japan_grader`) 与可自演进的动态准则 (`apex_judge`)，均由 Claude Code 作为评审代理执行。详见 [Rubric Judges 文档](docs/content/docs/guides/rubric-judge.mdx) 以及新增的 `examples/race-japan-elderly/`、`examples/apex-eggshell-skull/`、`examples/apex-frontier-bu/` 任务。
 - **[2026-03-18]** CORAL 正式发布！点击查看[Blog](https://human-agent-society.github.io/CORAL/)。
 
 ![Demo](assets/demo.gif)
@@ -182,8 +183,12 @@ task:
     评分器计算往返欧氏距离，返回 -distance 作为得分（越短越高）。
 
 grader:
-  type: function
-  module: eval.grader
+  # 快速开始走自动发现的 eval/grader.py（会触发 DeprecationWarning）。
+  # 生产任务建议把 grader 打包,改用 entrypoint:
+  #   entrypoint: "tsp_grader.grader:Grader"
+  #   setup: ["uv pip install -e ./grader"]
+  # 迁移指南见 docs/guides/custom-grader。
+  timeout: 300
 
 agents:
   count: 1
@@ -300,16 +305,15 @@ uv run ruff format .
 ⭐ 如果觉得 CORAL 对有帮助的话，欢迎给我们的 GitHub Repo 点个 Star。也可以考虑引用我们：
 
 ```bibtex
-@misc{coral2026,
-  title  = {Evolve Like Coral: Towards Autonomous Multi-Agent Evolution},
-  author = {Qu, Ao and Yan, Yihao and Zheng, Han and Zhou, Zijian and
-            Ong, Shao Yong and Hong, Fenglu and Zhu, Jiacheng and
-            Low, Bryan Kian Hsiang and Zhao, Jinhua and Liang, Paul Pu},
+@article{coral2026,
+  title  = {CORAL: Towards Autonomous Multi-Agent Evolution for Open-Ended Discovery},
+  author = {Qu, Ao and Zheng, Han and Zhou, Zijian and Yan, Yihao and Tang, Yihong and Ong, Shao Yong and Hong, Fenglu and Zhou, Kaichen and Jiang, Chonghe and Kong, Minwei and Zhu, Jiacheng and Jiang, Xuan and Li, Sirui and Wu, Cathy and Low, Bryan Kian Hsiang and Zhao, Jinhua and Liang, Paul Pu},
+  journal = {arXiv preprint arXiv:2604.01658},
   year   = {2026},
-  url    = {https://human-agent-society.github.io/CORAL/}
+  url    = {https://arxiv.org/pdf/2604.01658}
 }
 ```
 
 ### 致谢
 
-我们感谢 [TNT Accelerator](https://www.tnt.so/) 提供的慷慨支持，包括在开发过程中给予帮助的各种 API 积分。也要感谢许多如 [OpenEvolve](https://github.com/algorithmicsuperintelligence/openevolve)、[autoresearch](https://github.com/karpathy/autoresearch)、[TTT Discover](https://arxiv.org/abs/2503.08951) 等的十分有启发性的工作，这些工作为 Coral 的诞生奠定了基础。
+我们感谢 [TNT Accelerator](https://www.tnt.so/) 提供的慷慨支持，包括在开发过程中给予帮助的各种 API 积分。也要感谢许多如 [OpenEvolve](https://github.com/algorithmicsuperintelligence/openevolve)、[autoresearch](https://github.com/karpathy/autoresearch)、[TTT Discover](https://arxiv.org/abs/2601.16175) 等的十分有启发性的工作，这些工作为 Coral 的诞生奠定了基础。

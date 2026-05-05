@@ -33,6 +33,8 @@ class AgentRuntime(Protocol):
         prompt_source: str | None = None,
         task_name: str | None = None,
         task_description: str | None = None,
+        gateway_url: str | None = None,
+        gateway_api_key: str | None = None,
     ) -> AgentHandle: ...
 
     def extract_session_id(self, log_path: Path) -> str | None: ...
@@ -62,6 +64,12 @@ class AgentHandle:
     log_path: Path
     session_id: str | None = None
     _log_file: object | None = None  # keep reference to prevent GC closing the file
+    # Optional per-agent stderr capture under
+    # coral_dir/public/diagnostics/<agent_id>/agent.err. When present,
+    # AgentHandle.stop() closes the handle so we do not leak FDs across
+    # restart churn. None when the runtime did not split stderr.
+    err_file: object | None = None
+    err_path: Path | None = None
 
     @property
     def alive(self) -> bool:
@@ -104,6 +112,11 @@ class AgentHandle:
                 self._log_file.close()
             except Exception:
                 pass
+        if self.err_file is not None:
+            try:
+                self.err_file.close()  # type: ignore[attr-defined]
+            except Exception:
+                pass
 
     def interrupt(self) -> str | None:
         """Interrupt a running agent via SIGINT (like Ctrl+C).
@@ -142,6 +155,11 @@ class AgentHandle:
                 self._log_file.close()
             except Exception:
                 pass
+        if self.err_file is not None:
+            try:
+                self.err_file.close()  # type: ignore[attr-defined]
+            except Exception:
+                pass
 
         return _extract_session_id(self.log_path)
 
@@ -157,6 +175,8 @@ class AgentHandle:
             self._close_pipes()
             if self._log_file:
                 self._log_file.close()
+            if self.err_file is not None:
+                self.err_file.close()  # type: ignore[attr-defined]
         except Exception:
             pass
 

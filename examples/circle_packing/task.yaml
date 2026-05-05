@@ -24,10 +24,6 @@ task:
     - Multi-start local optimization with perturbation
     - Gradient descent on a smooth penalty formulation
     - Quasi-Newton methods (L-BFGS-B) with constraint handling
-  files:
-    - "initial_program.py"
-  seed:
-    - "initial_program.py"
   tips: |
     - Eval timeout is 600s. If your solution takes longer, it scores as a timeout.
     - The evaluator checks: all circles within the unit square, no overlaps, and measures sum of radii.
@@ -43,15 +39,21 @@ grader:
     program_file: "initial_program.py"
 
 agents:
-  count: 2
-  runtime: claude_code
-  model: claude-sonnet-4-6
+  count: 1
+  runtime: opencode
+  model: claude/claude-opus-4-6  # to be consistent with ./seed/opencode.json
+  gateway:
+    enabled: true
+    port: 4000  # to be consistent with ./seed/opencode.json
+    config: "./litellm_config.yaml"
 
 workspace:
   results_dir: "./results"
   repo_path: "./examples/circle_packing/seed"
+  setup:
+    - "uv pip install numpy scipy"
 
 run:
   verbose: false
   ui: false
-  tmux: true
+  session: docker

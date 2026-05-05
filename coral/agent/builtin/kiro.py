@@ -9,6 +9,8 @@ import threading
 from pathlib import Path
 from typing import Any
 
+from coral.agent.exit_classifier import classify_by_uptime
+from coral.agent.process import open_agent_stderr_for_log_dir
 from coral.agent.runtime import AgentHandle, write_coral_log_entry
 from coral.workspace.repo import _clean_env
 
@@ -29,6 +31,21 @@ class KiroRuntime:
     def extract_session_id(self, log_path: Path) -> str | None:
         return None  # Kiro doesn't expose session IDs in the same way
 
+    def classify_exit(
+        self,
+        log_path: Path,
+        exit_code: int | None,
+        uptime_seconds: float | None,
+        min_clean_runtime_seconds: int = 60,
+    ) -> str:
+        """Classify a Kiro subprocess exit using the uptime fallback.
+
+        Kiro emits plain text without a stable terminal marker, so we treat
+        an `exit_code==0` as clean only when the agent ran for at least
+        `min_clean_runtime_seconds`; shorter exits count as crashes.
+        """
+        return classify_by_uptime(exit_code, uptime_seconds, min_clean_runtime_seconds)
+
     def start(
         self,
         worktree_path: Path,
@@ -43,6 +60,11 @@ class KiroRuntime:
         prompt_source: str | None = None,
         task_name: str | None = None,
         task_description: str | None = None,
+        # Kiro does not currently route through the LiteLLM gateway, but
+        # accept these kwargs so the manager can call all four runtimes
+        # through a single signature without runtime-specific dispatch.
+        gateway_url: str | None = None,
+        gateway_api_key: str | None = None,
     ) -> AgentHandle:
         agent_id_file = worktree_path / ".coral_agent_id"
         agent_id = agent_id_file.read_text().strip() if agent_id_file.exists() else "unknown"
@@ -74,6 +96,15 @@ class KiroRuntime:
 
         log_file = open(log_path, "w", buffering=1)
 
+        # Per-agent stderr capture under public/diagnostics/<agent_id>/agent.err.
+        err_path: Path | None = None
+        err_file: Any = None
+        stderr_target: Any = subprocess.STDOUT
+        opened = open_agent_stderr_for_log_dir(log_dir, agent_id)
+        if opened is not None:
+            err_path, err_file = opened
+            stderr_target = err_file
+
         write_coral_log_entry(
             log_file,
             prompt=prompt,
@@ -88,7 +119,7 @@ class KiroRuntime:
                 cmd,
                 cwd=str(worktree_path),
                 stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
+                stderr=stderr_target,
                 start_new_session=True,
                 env=agent_env,
             )
@@ -117,7 +148,7 @@ class KiroRuntime:
                 cmd,
                 cwd=str(worktree_path),
                 stdout=log_file,
-                stderr=subprocess.STDOUT,
+                stderr=stderr_target,
                 start_new_session=True,
                 env=agent_env,
             )
@@ -131,4 +162,6 @@ class KiroRuntime:
             worktree_path=worktree_path,
             log_path=log_path,
             _log_file=log_file_ref,
+            err_file=err_file,
+            err_path=err_path,
         )
